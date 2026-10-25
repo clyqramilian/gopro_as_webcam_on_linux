@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""GTK4/libadwaita front end for the `gopro` webcam script.
+
+The GUI runs unprivileged and starts `gopro webcam -a -n ...` through pkexec.
+The privileged side is wrapped in a tiny shell helper that stops the whole
+gopro/ffmpeg process group as soon as the GUI closes the helper's stdin, so
+Stop (or a GUI crash) never leaves ffmpeg holding /dev/videoN.
+"""
+
+import os
+import re
+import shutil
+import signal
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.jschmid1.GoProWebcam"
+RESOLUTIONS = ["1080", "720", "480"]
+FOVS = ["linear", "wide", "narrow", "superview"]
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# Runs as root. Starts gopro in its own process group and kills that group once
+# stdin hits EOF (GUI closed the pipe) or gopro exits on its own.
+HELPER = r"""
+exec 3<&0
+setsid "$@" </dev/null &
+pid=$!
+trap 'kill -TERM -- -$pid 2>/dev/null' TERM HUP INT
+( cat <&3 >/dev/null; kill -TERM -- -$pid 2>/dev/null ) &
+wait $pid
+rc=$?
+kill $! 2>/dev/null
+exit $rc
+"""
+
+
+def find_gopro():
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "gopro")
+    for candidate in (shutil.which("gopro"), "/usr/local/sbin/gopro", here):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="GoPro Webcam", default_width=520, default_height=720)
+        self.proc = None
+        self.stdin = None
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        self.set_content(view)
+
+        page = Adw.PreferencesPage()
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_child(page)
+
+        main = Adw.PreferencesGroup(title="Stream")
+        self.res = Adw.ComboRow(title="Resolution", model=Gtk.StringList.new([r + "p" for r in RESOLUTIONS]))
+        self.fov = Adw.ComboRow(title="Field of view", model=Gtk.StringList.new(FOVS))
+        self.video_nr = Adw.SpinRow.new_with_range(0, 255, 1)
+        self.video_nr.set_title("Video device")
+        self.video_nr.set_subtitle("Creates /dev/video&lt;N&gt;")
+        self.video_nr.set_value(42)
+        for row in (self.res, self.fov, self.video_nr):
+            main.add(row)
+        page.add(main)
+
+        adv = Adw.PreferencesGroup(title="Advanced")
+        expander = Adw.ExpanderRow(title="Connection and crop", subtitle="Leave empty to auto-detect")
+        self.port = Adw.SpinRow.new_with_range(1, 65535, 1)
+        self.port.set_title("UDP port")
+        self.port.set_value(8554)
+        self.ip = Adw.EntryRow(title="Camera IP")
+        self.device = Adw.EntryRow(title="Network interface (e.g. enx9245589250e7)")
+        self.pattern = Adw.EntryRow(title="Interface pattern (e.g. enx)")
+        self.crop = Adw.EntryRow(title="Crop (w:h:x:y)")
+        for row in (self.port, self.ip, self.device, self.pattern, self.crop):
+            expander.add_row(row)
+        adv.add(expander)
+        page.add(adv)
+
+        self.button = Gtk.Button(label="Start webcam", halign=Gtk.Align.CENTER)
+        self.button.add_css_class("suggested-action")
+        self.button.add_css_class("pill")
+        self.button.connect("clicked", self.on_toggle)
+        ctl = Adw.PreferencesGroup()
+        ctl.add(self.button)
+        page.add(ctl)
+
+        self.log = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8,
+                                left_margin=12, right_margin=12)
+        logscroll = Gtk.ScrolledWindow(min_content_height=180, child=self.log)
+        logscroll.add_css_class("card")
+        logscroll.set_margin_start(12)
+        logscroll.set_margin_end(12)
+        logscroll.set_margin_bottom(12)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(scroll)
+        box.append(logscroll)
+        view.set_content(box)
+
+        self.connect("close-request", self.on_close)
+
+    # -- helpers ---------------------------------------------------------
+    def append_log(self, text):
+        buf = self.log.get_buffer()
+        buf.insert(buf.get_end_iter(), ANSI.sub("", text))
+        mark = buf.create_mark(None, buf.get_end_iter(), False)
+        self.log.scroll_to_mark(mark, 0, False, 0, 0)
+
+    def set_running(self, running):
+        self.button.set_label("Stop webcam" if running else "Start webcam")
+        for cls, on in (("destructive-action", running), ("suggested-action", not running)):
+            (self.button.add_css_class if on else self.button.remove_css_class)(cls)
+        for row in (self.res, self.fov, self.video_nr, self.port, self.ip, self.device, self.pattern, self.crop):
+            row.set_sensitive(not running)
+
+    def build_command(self):
+        cmd = [
+            "webcam", "-a", "-n",
+            "-r", RESOLUTIONS[self.res.get_selected()],
+            "-f", FOVS[self.fov.get_selected()],
+            "--video-number", str(int(self.video_nr.get_value())),
+            "--PORT", str(int(self.port.get_value())),
+        ]
+        for flag, row in (("-i", self.ip), ("-d", self.device), ("-p", self.pattern), ("-c", self.crop)):
+            value = row.get_text().strip()
+            if value:
+                cmd += [flag, value]
+        return cmd
+
+    # -- start / stop ----------------------------------------------------
+    def on_toggle(self, _button):
+        if self.proc:
+            self.stop()
+        else:
+            self.start()
+
+    def start(self):
+        script = find_gopro()
+        if not script:
+            self.append_log("Could not find the gopro script. Run ./install.sh first.\n")
+            return
+        for dep in ("pkexec", "ffmpeg", "curl"):
+            if not shutil.which(dep):
+                self.append_log(f"Missing dependency: {dep}\n")
+                return
+        if self.device.get_text().strip() and self.pattern.get_text().strip():
+            self.append_log("Interface and pattern are mutually exclusive; fill in only one.\n")
+            return
+
+        argv = ["pkexec", "/bin/sh", "-c", HELPER, "gopro-helper", script, *self.build_command()]
+        launcher = Gio.SubprocessLauncher.new(
+            Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        try:
+            self.proc = launcher.spawnv(argv)
+        except GLib.Error as e:
+            self.append_log(f"Failed to start: {e.message}\n")
+            return
+        self.stdin = self.proc.get_stdin_pipe()
+        self.append_log("$ " + " ".join(argv[5:]) + "\n")
+        self.set_running(True)
+        self.read_output(Gio.DataInputStream.new(self.proc.get_stdout_pipe()))
+        self.proc.wait_async(None, self.on_exit)
+
+    def read_output(self, stream):
+        def on_line(src, res):
+            try:
+                line, _ = src.read_line_finish_utf8(res)
+            except GLib.Error:
+                line = None
+            if line is None:
+                return
+            self.append_log(line + "\n")
+            src.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+    def stop(self):
+        # Closing stdin tells the root helper to terminate gopro and ffmpeg.
+        if self.stdin:
+            try:
+                self.stdin.close()
+            except GLib.Error:
+                pass
+            self.stdin = None
+        self.button.set_sensitive(False)
+        self.button.set_label("Stopping...")
+
+    def on_exit(self, proc, res):
+        try:
+            proc.wait_finish(res)
+            code = proc.get_exit_status() if proc.get_if_exited() else -1
+        except GLib.Error:
+            code = -1
+        self.append_log(f"\nExited with status {code}.\n")
+        self.proc = self.stdin = None
+        self.button.set_sensitive(True)
+        self.set_running(False)
+
+    def on_close(self, _win):
+        if self.proc:
+            self.stop()
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        (self.props.active_window or Window(self)).present()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    sys.exit(App().run(sys.argv))

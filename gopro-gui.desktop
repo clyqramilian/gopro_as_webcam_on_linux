@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GoPro Webcam
+Comment=Use a GoPro as a webcam
+Exec=gopro-gui
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;

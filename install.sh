@@ -25,12 +25,15 @@ if [ $EUID -ne 0 ]; then
 fi
 
 install -D ./gopro /usr/local/sbin/gopro
+install -D ./gopro-gui /usr/local/bin/gopro-gui
+install -D -m 644 ./gopro-gui.desktop /usr/local/share/applications/gopro-gui.desktop
 
 yellow "**********************"
 printf "\n\n"
 green "The GoPro install script succeeded"
 green "Run with with: "
 green "sudo gopro"
+green "or launch the GUI with: gopro-gui"
 printf "\n\n"
 yellow "**********************"
 
